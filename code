@@ -162,7 +162,48 @@ def check_strong_subadditivity(state):
                     violations.append((A, B, S_A + S_B, S_union + S_inter))
     return violations
 
+# ───────────────────────── DISCRETE EINSTEIN EXTENSION ─────────────────────────
+
+def compute_vertex_curvatures(delta_alpha):
+    """
+    Given a uniform alpha shift, approximate discrete curvature at each internal node of the binary tree.
+    For a balanced binary tree, each non-leaf vertex has degree 3 (except the root may have degree 2).
+    We define curvature κ_v ≈ -deg(v) * δα, interpreting a uniform increase in edge weights as negative curvature.
+    """
+    curvatures = {}
+    for v in bulk_tree.nodes:
+        deg = bulk_tree.degree[v]
+        if deg > 1:  # internal node
+            curvatures[v] = -deg * delta_alpha
+        else:
+            curvatures[v] = 0.0  # leaves have no curvature contribution
+    return curvatures
+
+
+def boundary_energy_change(params_base, params_theta, theta):
+    """
+    Compute a proxy for boundary stress-energy by measuring local Pauli-Z expectation shift on each qubit.
+    Returns dict mapping qubit index -> ΔE_i = <Z_i>(theta) - <Z_i>(0).
+    """
+    # Base state at theta=0
+    state_base = mera_circuit(params_base, theta=0.0, noise=False)
+    # Perturbed state at given theta
+    state_theta = mera_circuit(params_theta, theta=theta, noise=False)
+    energy_change = {}
+    # Measure single-qubit Z expectation for each qubit
+    for i in range(CFG["n_qubits"]):
+        # Define QNode for Z expectation on wire i
+        @qml.qnode(dev)
+        def exp_z(state_vec):
+            qml.QubitStateVector(state_vec, wires=range(CFG["n_qubits"]))
+            return qml.expval(qml.PauliZ(i))
+        E_base = exp_z(state_base)
+        E_theta = exp_z(state_theta)
+        energy_change[i] = float(E_theta - E_base)
+    return energy_change
+
 # ───────────────────────── MAIN RUN / STUDY ─────────────────────────
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--mode", choices=["run", "test"], default="run")
