@@ -1,251 +1,269 @@
-import numpy as np
-import torch
-import matplotlib.pyplot as plt
-import pandas as pd
+# QEMAR++: Comprehensive 16‑Qubit Discrete RT, Inequalities, and Robustness
+
 import os
-from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
-from sklearn.preprocessing import StandardScaler
-from sklearn.model_selection import train_test_split
-import xgboost as xgb
+import argparse
+import numpy as np
+import matplotlib.pyplot as plt
 import pennylane as qml
-from torch import nn
-from tqdm import tqdm
-import gc
-import webbrowser
-from pathlib import Path
-import time
+from pennylane import numpy as pnp
+import networkx as nx
 
-np.random.seed(42)
-torch.manual_seed(42)
+# ───────────────────────── CONFIGURATION ─────────────────────────
+CFG = {
+    "n_qubits": 16,             # Must be a power of 2
+    "n_layers": 3,              # MERA-like circuit layers
+    "n_seeds": 3,               # Random initial seeds for statistics
+    "theta_values": [0.0, 0.3, 0.6, 1.0],  # Gate-angle sweep
+    "noise_prob": 0.05,         # Bit-flip probability for noise
+    "save_dir": "qemar_rt_full16"  # Output directory
+}
+# Ensure save directory exists
+os.makedirs(CFG["save_dir"], exist_ok=True)
 
-print("Working directory:", os.getcwd())
+def validate_config(cfg):
+    n = cfg["n_qubits"]
+    if n & (n - 1) != 0:
+        raise ValueError(f"n_qubits must be a power of 2, got {n}")
+    return int(np.log2(n))
 
-n_samples = 5000
-X = np.random.rand(n_samples, 3)
-X[:, 0] *= 5.0
-X[:, 1] = X[:, 1] * 8.0 + 2.0
-X[:, 2] *= 0.5
-y = -1.0 * (0.5 * X[:, 0]**2 - 0.3 * X[:, 1] + 2.0 * X[:, 2]**0.5) / 2.0
-y += np.random.normal(0, 0.2, n_samples)
+# Compute tree height needed so that number of leaves = n_qubits
+TREE_HEIGHT = validate_config(CFG)
+# PennyLane device
+dev = qml.device("default.qubit", wires=CFG["n_qubits"], shots=None)
 
-X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+# ───────────────────────── MERA CIRCUIT ─────────────────────────
+@qml.qnode(dev, interface="autograd")
+def mera_circuit(params, theta=0.0, noise=False):
+    n = CFG["n_qubits"]
+    # Initialize to |0>^n
+    qml.BasisState(np.zeros(n, dtype=int), wires=range(n))
+    # Optional noise: random X flips
+    if noise:
+        for q in range(n):
+            if np.random.rand() < CFG["noise_prob"]:
+                qml.PauliX(wires=q)
+    # Layer 0: pairs (0,1),(2,3)...
+    offset = 0
+    for i in range(0, n, 2):
+        qml.RY(params[0, offset+0] + theta, wires=i)
+        qml.RY(params[0, offset+1], wires=i+1)
+        qml.CNOT(wires=[i, i+1])
+        qml.RY(params[0, offset+2], wires=i)
+        qml.RY(params[0, offset+3] + theta, wires=i+1)
+        offset += 4
+    # Layer 1: pairs (1,2),(3,4)...
+    offset = 0
+    for a, b in [(i, i+1) for i in range(1, n-1, 2)]:
+        qml.RY(params[1, offset+0], wires=a)
+        qml.RY(params[1, offset+1] + theta, wires=b)
+        qml.CNOT(wires=[a, b])
+        qml.RY(params[1, offset+2] + theta, wires=a)
+        qml.RY(params[1, offset+3], wires=b)
+        offset += 4
+    # Layer 2: long-range pairs (0,3),(4,7),(8,11),(12,15)
+    offset = 0
+    pairs = [(0,3),(4,7),(8,11),(12,15)]
+    for (a, b) in pairs:
+        qml.RY(params[2, offset+0] + theta, wires=a)
+        qml.RY(params[2, offset+1], wires=b)
+        qml.CNOT(wires=[a, b])
+        qml.RY(params[2, offset+2], wires=a)
+        qml.RY(params[2, offset+3] + theta, wires=b)
+        offset += 4
+    return qml.state()
 
-scaler = StandardScaler()
-X_train_scaled = scaler.fit_transform(X_train)
-X_test_scaled = scaler.transform(X_test)
+# Initialize random MERA parameters: 3 layers each with (n/2)*4 parameters
+layer_size = (CFG["n_qubits"] // 2) * 4
+np.random.seed(0)
+mera_params = pnp.random.normal(0, 0.1, (CFG["n_layers"], layer_size))
 
-n_qubits = 4
-n_layers = 6
-dev = qml.device("default.qubit", wires=n_qubits)
+# ───────────────────────── ENTANGLEMENT METRICS ─────────────────────────
+def reduced_dm(state, subsys):
+    n = CFG["n_qubits"]
+    dims = [2] * n
+    psi = pnp.reshape(state, dims)
+    keep = list(subsys)
+    trace_out = [i for i in range(n) if i not in keep]
+    rho = pnp.tensordot(psi, pnp.conj(psi), axes=(trace_out, trace_out))
+    dim_sub = 2 ** len(subsys)
+    return pnp.reshape(rho, (dim_sub, dim_sub))
 
-@qml.qnode(dev, interface="torch", diff_method="parameter-shift")
-def quantum_circuit(inputs, weights):
-    qml.AngleEmbedding(inputs, wires=range(n_qubits))
-    qml.BasicEntanglerLayers(weights, wires=range(n_qubits))
-    return [qml.expval(qml.PauliZ(wires=i)) for i in range(n_qubits)]
+def entropy(state, subsys):
+    rho = reduced_dm(state, subsys)
+    evs = qml.math.eigvalsh(rho)
+    evs = pnp.clip(evs, 1e-9, 1)
+    return float(-pnp.sum(evs * pnp.log(evs)))
 
-class HybridModel(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.q_params = nn.Parameter(0.01 * torch.randn(n_layers, n_qubits))
-        self.classical_layer = nn.Linear(n_qubits, 1)
-        
-    def forward(self, x):
-        batch_size = 16
-        outputs = []
-        for i in range(0, len(x), batch_size):
-            batch = x[i:i+batch_size]
-            q_out_batch = []
-            for xi in batch:
-                q_out_batch.append(torch.tensor(quantum_circuit(xi, self.q_params), dtype=torch.float32))
-            q_out = torch.stack(q_out_batch)
-            batch_output = self.classical_layer(q_out)
-            outputs.append(batch_output)
-            if i % 160 == 0 and i > 0:
-                gc.collect()
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-        return torch.cat(outputs, dim=0)
+# Contiguous and noncontiguous region lists
 
-def process_in_chunks(model, data, chunk_size=500):
-    results = []
-    for i in range(0, len(data), chunk_size):
-        chunk = data[i:i+chunk_size]
-        with torch.no_grad():
-            chunk_result = model(chunk).detach().cpu().numpy()
-        results.append(chunk_result)
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-    return np.vstack(results)
+def contiguous_regions(n):
+    regions = []
+    for length in range(1, n):
+        for start in range(n - length + 1):
+            regions.append(tuple(range(start, start + length)))
+    return regions
 
-model = HybridModel()
-optimizer = torch.optim.Adam(model.parameters(), lr=0.005)
-loss_fn = nn.MSELoss()
+def noncontiguous_pairs(n):
+    contiguous = contiguous_regions(n)
+    unions = []
+    for i in range(len(contiguous)):
+        for j in range(i+1, len(contiguous)):
+            A, B = set(contiguous[i]), set(contiguous[j])
+            if A.isdisjoint(B):
+                unions.append(tuple(sorted(A | B)))
+    return unions
 
-X_train_torch = torch.tensor(X_train_scaled, dtype=torch.float32)
-y_train_torch = torch.tensor(y_train, dtype=torch.float32).reshape(-1, 1)
-X_test_torch = torch.tensor(X_test_scaled, dtype=torch.float32)
+regions = contiguous_regions(CFG["n_qubits"])
+unions = noncontiguous_pairs(CFG["n_qubits"])
 
-batch_size = 64
-losses = []
-epochs = 100
-patience = 10
-best_loss = float('inf')
-patience_counter = 0
+# ───────────────────────── BULK HYPERBOLIC LATTICE ─────────────────────────
+bulk_tree = nx.balanced_tree(r=2, h=TREE_HEIGHT)
+leaves = sorted([node for node in bulk_tree.nodes if bulk_tree.degree[node] == 1 and node != 0])
+leaf_to_qubit = {leaf: idx for idx, leaf in enumerate(leaves)}
 
-chunk_size = 1000
-train_chunks = [(X_train_torch[i:i+chunk_size], y_train_torch[i:i+chunk_size]) 
-                for i in range(0, len(X_train_torch), chunk_size)]
+from functools import lru_cache
+@lru_cache(maxsize=None)
+def cut_length(region_qubits_tuple):
+    region_qubits = list(region_qubits_tuple)
+    region_nodes = [leaf for leaf, q in leaf_to_qubit.items() if q in region_qubits]
+    outside_nodes = [leaf for leaf, q in leaf_to_qubit.items() if q not in region_qubits]
+    min_cut = float('inf')
+    for u in region_nodes:
+        for v in outside_nodes:
+            cut_edges = nx.minimum_edge_cut(bulk_tree, u, v)
+            min_cut = min(min_cut, len(cut_edges))
+    return min_cut
 
-print("Training Quantum-Hybrid Model...")
-for epoch in tqdm(range(epochs), desc="Epochs"):
-    model.train()
-    epoch_losses = []
-    for chunk_idx, (X_chunk, y_chunk) in enumerate(train_chunks):
-        chunk_losses = []
-        for i in range(0, len(X_chunk), batch_size):
-            X_batch = X_chunk[i:i+batch_size]
-            y_batch = y_chunk[i:i+batch_size]
-            optimizer.zero_grad()
-            preds = model(X_batch)
-            loss = loss_fn(preds, y_batch)
-            loss.backward()
-            optimizer.step()
-            chunk_losses.append(loss.item())
-        avg_chunk_loss = sum(chunk_losses) / len(chunk_losses)
-        epoch_losses.append(avg_chunk_loss)
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-    avg_loss = sum(epoch_losses) / len(epoch_losses)
-    losses.append(avg_loss)
-    if (epoch + 1) % 10 == 0:
-        print(f"Epoch {epoch+1}/{epochs}, Loss: {avg_loss:.6f}")
-    if avg_loss < best_loss:
-        best_loss = avg_loss
-        patience_counter = 0
+# Solve alpha via least squares
+
+def solve_alpha(ent_dict, bulk_dict):
+    S = np.array([ent_dict[R] for R in ent_dict])
+    L = np.array([bulk_dict[R] for R in ent_dict])
+    alpha_opt = np.dot(L, S) / np.dot(S, S)
+    loss_val = np.sum((L - alpha_opt * S) ** 2)
+    return alpha_opt, loss_val
+
+# Check strong subadditivity
+
+def check_strong_subadditivity(state):
+    violations = []
+    cr = contiguous_regions(CFG["n_qubits"])
+    for A in cr:
+        for B in cr:
+            A_set, B_set = set(A), set(B)
+            union = tuple(sorted(A_set | B_set))
+            inter = tuple(sorted(A_set & B_set))
+            if inter and len(union) < CFG["n_qubits"]:
+                S_A = entropy(state, list(A))
+                S_B = entropy(state, list(B))
+                S_union = entropy(state, list(union))
+                S_inter = entropy(state, list(inter))
+                if S_A + S_B < S_union + S_inter - 1e-6:
+                    violations.append((A, B, S_A + S_B, S_union + S_inter))
+    return violations
+
+# ───────────────────────── MAIN RUN / STUDY ─────────────────────────
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--mode", choices=["run", "test"], default="run")
+    args = parser.parse_args()
+
+    if args.mode == "test":
+        # Bell state entropy and SSA test
+        dev2 = qml.device("default.qubit", wires=2)
+        @qml.qnode(dev2)
+        def bell():
+            qml.Hadamard(wires=0); qml.CNOT(wires=[0,1]); return qml.state()
+        s = bell()
+        assert abs(entropy(s, [0]) - np.log(2)) < 1e-6, "Bell entropy test failed"
+        vio = check_strong_subadditivity(s)
+        assert not vio, f"SSA violated: {vio}"
+        print("✅ Tests passed.")
+        exit(0)
+
+    # 1) Alpha distribution over seeds (theta=0, no noise)
+    alpha_list = []
+    for seed in range(CFG["n_seeds"]):
+        np.random.seed(seed)
+        params = pnp.random.normal(0, 0.1, (CFG["n_layers"], layer_size))
+        st = mera_circuit(params, theta=0.0, noise=False)
+        ent_dict = {R: entropy(st, list(R)) for R in regions}
+        bulk_dict = {R: cut_length(R) for R in regions}
+        alpha_s, _ = solve_alpha(ent_dict, bulk_dict)
+        alpha_list.append(alpha_s)
+    # Plot histogram
+    plt.hist(alpha_list, bins=len(alpha_list), color='skyblue', edgecolor='k')
+    plt.title("Alpha Distribution")
+    plt.xlabel("alpha"); plt.ylabel("Frequency")
+    plt.savefig(os.path.join(CFG["save_dir"], "alpha_hist.png"), dpi=150); plt.close()
+
+    # 2) Theta sweep (no noise)
+    theta_alphas = []
+    for theta in CFG["theta_values"]:
+        params = pnp.random.normal(0, 0.1, (CFG["n_layers"], layer_size))
+        st = mera_circuit(params, theta=theta, noise=False)
+        ent_dict = {R: entropy(st, list(R)) for R in regions}
+        bulk_dict = {R: cut_length(R) for R in regions}
+        alpha_t, _ = solve_alpha(ent_dict, bulk_dict)
+        theta_alphas.append(alpha_t)
+    plt.plot(CFG["theta_values"], theta_alphas, 'o-', color='red')
+    plt.title("Alpha vs Theta")
+    plt.xlabel("theta"); plt.ylabel("alpha")
+    plt.grid(alpha=0.3)
+    plt.savefig(os.path.join(CFG["save_dir"], "alpha_vs_theta.png"), dpi=150); plt.close()
+
+    # 3) Noise robustness (theta=0)
+    noise_shift = []
+    for seed in range(CFG["n_seeds"]):
+        np.random.seed(seed)
+        params = pnp.random.normal(0, 0.1, (CFG["n_layers"], layer_size))
+        st_clean = mera_circuit(params, theta=0.0, noise=False)
+        st_noisy = mera_circuit(params, theta=0.0, noise=True)
+        ent_c = {R: entropy(st_clean, list(R)) for R in regions}
+        ent_n = {R: entropy(st_noisy, list(R)) for R in regions}
+        bulk_d = {R: cut_length(R) for R in regions}
+        a_c, _ = solve_alpha(ent_c, bulk_d)
+        a_n, _ = solve_alpha(ent_n, bulk_d)
+        noise_shift.append(a_n - a_c)
+    plt.bar(range(len(noise_shift)), noise_shift, color='orange', edgecolor='k')
+    plt.title("Noise-Induced Alpha Shift")
+    plt.xlabel("Seed"); plt.ylabel("Δ alpha")
+    plt.grid(alpha=0.3)
+    plt.savefig(os.path.join(CFG["save_dir"], "noise_shift.png"), dpi=150); plt.close()
+
+    # 4) SSA on final state (theta=0, no noise)
+    params = pnp.random.normal(0, 0.1, (CFG["n_layers"], layer_size))
+    st_final = mera_circuit(params, theta=0.0, noise=False)
+    vio_final = check_strong_subadditivity(st_final)
+    if vio_final:
+        print(f"⚠️ SSA Violations: {vio_final[:3]}...")
     else:
-        patience_counter += 1
-        if patience_counter >= patience:
-            print(f"Early stopping at epoch {epoch+1}")
-            break
+        print("✅ No SSA violations.")
 
-print("Training XGBoost Model...")
-xgb_model = xgb.XGBRegressor(
-    n_estimators=100,
-    learning_rate=0.1,
-    tree_method='hist',
-    max_depth=6,
-    subsample=0.8,
-    colsample_bytree=0.8,
-    random_state=42
-)
+    # 5) Final RT scatter and bulk tree plot
+    ent_f = {R: entropy(st_final, list(R)) for R in regions}
+    bulk_f = {R: cut_length(R) for R in regions}
+    a_f, l_f = solve_alpha(ent_f, bulk_f)
+    S_vals = np.array(list(ent_f.values())); L_vals = np.array(list(bulk_f.values()))
+    plt.scatter(S_vals, L_vals, color="blue", alpha=0.6)
+    xs = np.linspace(0, S_vals.max()*1.1, 100)
+    plt.plot(xs, a_f*xs, 'r--', label=f"α={a_f:.2f}")
+    plt.xlabel("S(R)"); plt.ylabel("|γ(R)|"); plt.legend(); plt.title("RT Scatter 16-Qubit")
+    plt.grid(alpha=0.3)
+    plt.savefig(os.path.join(CFG["save_dir"], "rt_scatter16.png"), dpi=150); plt.close()
 
-chunk_size = 2500
-for i in range(0, len(X_train_scaled), chunk_size):
-    end_idx = min(i + chunk_size, len(X_train_scaled))
-    if i == 0:
-        xgb_model.fit(X_train_scaled[i:end_idx], y_train[i:end_idx])
-    else:
-        xgb_model.fit(
-            X_train_scaled[i:end_idx], 
-            y_train[i:end_idx],
-            xgb_model=xgb_model.get_booster(),
-            eval_set=[(X_train_scaled[i:end_idx], y_train[i:end_idx])],
-            verbose=False
-        )
-    gc.collect()
-
-print("Running model inference...")
-model.eval()
-quantum_preds = process_in_chunks(model, X_test_torch).flatten()
-xgb_preds = xgb_model.predict(X_test_scaled)
-
-quantum_mae = mean_absolute_error(y_test, quantum_preds)
-quantum_rmse = np.sqrt(mean_squared_error(y_test, quantum_preds))
-quantum_r2 = r2_score(y_test, quantum_preds)
-
-xgb_mae = mean_absolute_error(y_test, xgb_preds)
-xgb_rmse = np.sqrt(mean_squared_error(y_test, xgb_preds))
-xgb_r2 = r2_score(y_test, xgb_preds)
-
-print("\nModel Performance Metrics:")
-print(f"Quantum Model - MAE: {quantum_mae:.6f} eV/atom, RMSE: {quantum_rmse:.6f} eV/atom, R²: {quantum_r2:.4f}")
-print(f"XGBoost Model - MAE: {xgb_mae:.6f} eV/atom, RMSE: {xgb_rmse:.6f} eV/atom, R²: {xgb_r2:.4f}")
-
-print("Generating visualizations...")
-quantum_residuals = quantum_preds - y_test
-xgb_residuals = xgb_preds - y_test
-
-sample_size = 500
-sample_indices = np.random.choice(len(y_test), sample_size, replace=False)
-
-del X_train_torch, y_train_torch
-gc.collect()
-if torch.cuda.is_available():
-    torch.cuda.empty_cache()
-
-vis_dir = os.getcwd()
-residual_path = os.path.join(vis_dir, 'residual_analysis.png')
-training_path = os.path.join(vis_dir, 'training_and_predictions.png')
-metrics_path = os.path.join(vis_dir, 'metrics_comparison.png')
-
-try:
-    plt.figure(figsize=(20, 16))
-    plt.subplot(2, 2, 1)
-    plt.hist(quantum_residuals[sample_indices], bins=20, alpha=0.7, label="Quantum Residuals")
-    plt.hist(xgb_residuals[sample_indices], bins=20, alpha=0.7, label="XGBoost Residuals")
-    plt.axvline(0, color='black', linestyle='--')
-    plt.title("Residual Distribution (Sample)", fontsize=16)
-    plt.xlabel("Prediction Error", fontsize=14)
-    plt.ylabel("Frequency", fontsize=14)
-    plt.legend(fontsize=12)
-    plt.subplot(2, 2, 2)
-    boxplot = plt.boxplot([quantum_residuals[sample_indices], xgb_residuals[sample_indices]], 
-                labels=["Quantum", "XGBoost"])
-    plt.title("Residual Spread by Model (Sample)", fontsize=16)
-    plt.ylabel("Prediction Error", fontsize=14)
-    plt.subplot(2, 2, 3)
-    plt.plot(losses, linewidth=2)
-    plt.title("Quantum Model Training Loss", fontsize=16)
-    plt.xlabel("Epoch", fontsize=14)
-    plt.ylabel("Loss", fontsize=14)
-    plt.subplot(2, 2, 4)
-    bar_width = 0.35
-    index = np.arange(3)
-    quantum_performance = [quantum_mae, quantum_rmse, quantum_r2]
-    xgb_performance = [xgb_mae, xgb_rmse, xgb_r2]
-    bars1 = plt.bar(index - bar_width / 2, quantum_performance, bar_width, 
-                   label='Quantum', alpha=0.7, color='royalblue')
-    bars2 = plt.bar(index + bar_width / 2, xgb_performance, bar_width, 
-                   label='XGBoost', alpha=0.7, color='darkorange')
-    plt.xlabel('Metric', fontsize=14)
-    plt.ylabel('Value', fontsize=14)
-    plt.title('Model Comparison: MAE, RMSE, R² Score', fontsize=16)
-    plt.xticks(index, ['MAE', 'RMSE', 'R²'], fontsize=12)
-    plt.legend(fontsize=12)
-    def add_value_labels(bars):
-        for bar in bars:
-            height = bar.get_height()
-            plt.annotate(f'{height:.4f}',
-                         xy=(bar.get_x() + bar.get_width() / 2, height),
-                         xytext=(0, 3),
-                         textcoords="offset points",
-                         ha='center', va='bottom',
-                         fontsize=10)
-    add_value_labels(bars1)
-    add_value_labels(bars2)
-    plt.suptitle("Hybrid Quantum-Classical ML for Predicting Borophene Formation Energy", fontsize=20)
-    plt.tight_layout(rect=[0, 0, 1, 0.96])
-    combined_path = os.path.join(vis_dir, 'combined_results.png')
-    plt.savefig(combined_path, dpi=300)
-    print(f"Saved combined visualization to {combined_path}")
+    # Bulk tree visualization
+    plt.figure(figsize=(6,6))
     try:
-        webbrowser.open('file://' + os.path.abspath(combined_path))
-        print(f"Opening combined visualization automatically...")
-    except Exception as e:
-        print(f"Could not open visualization automatically: {e}")
-    plt.close()
-except Exception as e:
-    print(f"Error creating combined visualization: {e}")
+        pos = nx.nx_agraph.graphviz_layout(bulk_tree, prog='twopi', args='-Grankdir=BT')
+    except Exception:
+        pos = nx.spring_layout(bulk_tree)
+    nx.draw(bulk_tree, pos, node_color='lightgray', node_size=100)
+    for leaf, q in leaf_to_qubit.items():
+        x, y = pos[leaf]
+        plt.text(x, y, str(q), color='red', fontsize=10, ha='center', va='center')
+    plt.title("Bulk Binary Tree (Leaves = Qubits)")
+    plt.savefig(os.path.join(CFG["save_dir"], "bulk_tree16.png"), dpi=150); plt.close()
+
+    print("🚀 Full 16‑qubit RT study complete.")
+    print(f"Results in {CFG['save_dir']}")
